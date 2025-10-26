@@ -1,212 +1,199 @@
 // server.c
-// A simple concurrent TCP echo server using pthreads.
-// - Binds to the given port on all interfaces (IPv4/IPv6).
-// - Spawns one detached thread per client.
-// - Echoes back whatever each client sends.
-// Build: gcc -Wall -Wextra -O2 server.c -o server -pthread
+// Concurrent TCP echo server using forked child processes (no threads).
+// Usage: ./server <port>
+// Example: ./server 5000
 
-#define \_POSIX_C_SOURCE 200112L
+#define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
-#include <netdb.h>
-#include <pthread.h>
+#include <netinet/in.h>
 #include <signal.h>
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
-static volatile sig_atomic_t g_stop = 0;
+#define BACKLOG 128
+#define BUFSZ 4096
 
-static void on_sigint(int sig)
+static void die(const char *msg)
 {
-    (void)sig;
-    g_stop = 1; // tell the accept loop to stop
+    perror(msg);
+    exit(EXIT_FAILURE);
 }
 
-// Small helper to print peer address (IP:port)
-static void addr_to_string(const struct sockaddr *sa, char *out, size_t outlen)
+// Reap all dead children to avoid zombies.
+static void sigchld_handler(int signo)
 {
-    char host[NI_MAXHOST], serv[NI_MAXSERV];
-    int rc = getnameinfo(sa, (sa->sa_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6),
-                         host, sizeof(host), serv, sizeof(serv),
-                         NI_NUMERICHOST | NI_NUMERICSERV);
-    if (rc == 0)
-        snprintf(out, outlen, "%s:%s", host, serv);
-    else
-        snprintf(out, outlen, "unknown");
+    (void)signo;
+    // Use non-blocking waitpid in a loop.
+    while (waitpid(-1, NULL, WNOHANG) > 0)
+    { /* reap */
+    }
 }
 
-struct client_ctx
+// Read a line (ending in '\n') from fd into buf (up to bufsz-1 chars).
+// Returns number of bytes in buf (>=0), 0 on EOF, or -1 on error.
+static ssize_t readline(int fd, char *buf, size_t bufsz)
 {
-    int fd;
-    struct sockaddr_storage addr;
-    socklen_t addrlen;
-};
-
-static void *client_thread(void *arg)
-{
-    struct client_ctx _ctx = (struct client_ctx _)arg;
-    int fd = ctx->fd;
-
-    // Log connection
-    char peer[128];
-    addr_to_string((struct sockaddr *)&ctx->addr, peer, sizeof(peer));
-    fprintf(stderr, "[+] client connected: %s\n", peer);
-
-    free(ctx); // no longer needed in this thread
-
-    // Echo loop
-    char buf[4096];
-    for (;;)
+    size_t i = 0;
+    while (i + 1 < bufsz)
     {
-        ssize_t n = recv(fd, buf, sizeof(buf), 0);
+        char c;
+        ssize_t n = read(fd, &c, 1);
         if (n == 0)
+        { // EOF
+            if (i == 0)
+                return 0; // no data read
+            break;        // return partial line
+        }
+        if (n < 0)
         {
-            // orderly shutdown from client
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        buf[i++] = c;
+        if (c == '\n')
+            break;
+    }
+    buf[i] = '\0';
+    return (ssize_t)i;
+}
+
+static void to_upper(char *s)
+{
+    for (; *s; ++s)
+        *s = (char)toupper((unsigned char)*s);
+}
+
+static void handle_client(int connfd, struct sockaddr_in *peer)
+{
+    char addr[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &peer->sin_addr, addr, sizeof(addr));
+    int p = ntohs(peer->sin_port);
+    fprintf(stderr, "[child %ld] connected: %s:%d\n", (long)getpid(), addr, p);
+
+    char line[BUFSZ];
+    while (1)
+    {
+        ssize_t n = readline(connfd, line, sizeof(line));
+        if (n == 0)
+        { // client closed
             break;
         }
         else if (n < 0)
         {
             if (errno == EINTR)
                 continue;
-            perror("recv");
+            perror("readline");
             break;
         }
-        // Echo back the same bytes
-        ssize_t sent = 0;
-        while (sent < n)
+        // Transform to uppercase and echo back.
+        to_upper(line);
+        size_t to_write = strlen(line);
+        size_t off = 0;
+        while (off < to_write)
         {
-            ssize_t m = send(fd, buf + sent, (size_t)(n - sent), 0);
+            ssize_t m = write(connfd, line + off, to_write - off);
             if (m < 0)
             {
                 if (errno == EINTR)
                     continue;
-                perror("send");
-                close(fd);
-                pthread_exit(NULL);
+                perror("write");
+                goto done;
             }
-            sent += m;
+            off += (size_t)m;
         }
     }
 
-    fprintf(stderr, "[-] client disconnected: %s\n", peer);
-    close(fd);
-    pthread_exit(NULL);
+done:
+    fprintf(stderr, "[child %ld] disconnected: %s:%d\n", (long)getpid(), addr, p);
+    close(connfd);
 }
 
-int main(int argc, char \**argv)
+int main(int argc, char **argv)
 {
     if (argc != 2)
     {
-        fprintf(stderr, "usage: %s <port>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <port>\n", argv[0]);
         return EXIT_FAILURE;
     }
-    const char *port = argv[1];
-
-    // Handle Ctrl+C gracefully
-    struct sigaction sa = {0};
-    sa.sa_handler = on_sigint;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, NULL);
-    signal(SIGPIPE, SIG_IGN); // avoid crashes if a client disappears
-
-    // Prepare passive address(es)
-    struct addrinfo hints, *res = NULL, *rp = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;     // IPv4 or IPv6
-    hints.ai_socktype = SOCK_STREAM; // TCP
-    hints.ai_flags = AI_PASSIVE;     // for binding
-
-    int rc = getaddrinfo(NULL, port, &hints, &res);
-    if (rc != 0)
+    int port = atoi(argv[1]);
+    if (port <= 0 || port > 65535)
     {
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rc));
+        fprintf(stderr, "Invalid port.\n");
         return EXIT_FAILURE;
     }
 
-    int listen_fd = -1;
+    // Ignore SIGPIPE so unexpected client closes don't kill us.
+    signal(SIGPIPE, SIG_IGN);
 
-    // Try each candidate until one binds
-    for (rp = res; rp != NULL; rp = rp->ai_next)
+    // Reap children.
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigchld_handler;
+    sa.sa_flags = SA_RESTART; // restart accept() after handler
+    if (sigaction(SIGCHLD, &sa, NULL) == -1)
+        die("sigaction");
+
+    int listenfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listenfd < 0)
+        die("socket");
+
+    // Allow fast restarts.
+    int yes = 1;
+    if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) < 0)
+        die("setsockopt(SO_REUSEADDR)");
+
+    struct sockaddr_in srv;
+    memset(&srv, 0, sizeof(srv));
+    srv.sin_family = AF_INET;
+    srv.sin_addr.s_addr = htonl(INADDR_ANY);
+    srv.sin_port = htons((uint16_t)port);
+
+    if (bind(listenfd, (struct sockaddr *)&srv, sizeof(srv)) < 0)
+        die("bind");
+    if (listen(listenfd, BACKLOG) < 0)
+        die("listen");
+
+    fprintf(stderr, "Server listening on port %d ...\n", port);
+
+    // Accept loop: fork a child per connection.
+    for (;;)
     {
-        listen_fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (listen_fd < 0)
-            continue;
-
-        int yes = 1;
-        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-#ifdef IPV6_V6ONLY
-        if (rp->ai_family == AF_INET6)
+        struct sockaddr_in peer;
+        socklen_t plen = sizeof(peer);
+        int connfd = accept(listenfd, (struct sockaddr *)&peer, &plen);
+        if (connfd < 0)
         {
-            int v6only = 0; // allow IPv4-mapped connections too
-            setsockopt(listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
-        }
-#endif
-        if (bind(listen_fd, rp->ai_addr, rp->ai_addrlen) == 0)
-        {
-            // success
-            break;
-        }
-        close(listen_fd);
-        listen_fd = -1;
-    }
-    freeaddrinfo(res);
-
-    if (listen_fd < 0)
-    {
-        perror("bind");
-        return EXIT_FAILURE;
-    }
-
-    if (listen(listen_fd, SOMAXCONN) != 0)
-    {
-        perror("listen");
-        close(listen_fd);
-        return EXIT_FAILURE;
-    }
-
-    fprintf(stderr, "[*] listening on port %s ... (Ctrl+C to stop)\n", port);
-
-    // Accept loop
-    while (!g_stop)
-    {
-        struct client_ctx *ctx = malloc(sizeof(*ctx));
-        if (!ctx)
-        {
-            perror("malloc");
-            break;
-        }
-        ctx->addrlen = sizeof(ctx->addr);
-        ctx->fd = accept(listen_fd, (struct sockaddr *)&ctx->addr, &ctx->addrlen);
-        if (ctx->fd < 0)
-        {
-            free(ctx);
             if (errno == EINTR)
-                continue; // probably Ctrl+C
-            perror("accept");
-            break;
+                continue; // interrupted by signal
+            die("accept");
         }
 
-        pthread_t tid;
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        int prc = pthread_create(&tid, &attr, client_thread, ctx);
-        pthread_attr_destroy(&attr);
-        if (prc != 0)
+        pid_t pid = fork();
+        if (pid < 0)
         {
-            fprintf(stderr, "pthread_create: %s\n", strerror(prc));
-            close(ctx->fd);
-            free(ctx);
+            perror("fork");
+            close(connfd);
+            continue;
+        }
+        else if (pid == 0)
+        {
+            // Child process: close listener, handle the client.
+            close(listenfd);
+            handle_client(connfd, &peer);
+            _exit(0);
+        }
+        else
+        {
+            // Parent: close connected socket, go back to accept().
+            close(connfd);
         }
     }
-
-    fprintf(stderr, "[*] shutting down listener\n");
-    close(listen_fd);
-    return EXIT_SUCCESS;
 }
